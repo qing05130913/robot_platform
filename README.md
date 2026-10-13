@@ -135,3 +135,5 @@ Authorization: Bearer token_alice
 - 接口文档（Swagger）：http://127.0.0.1:8000/docs
 - 数据库连通性：访问 http://127.0.0.1:8000/test-db
 - 认证：点击右上角 **Authorize**，Value 处填入 Token（如 `token_alice`），点击 **Authorize** 后，受保护接口会自动携带 `Authorization: Bearer token_alice`。
+
+Git version control is enabled for this project.
