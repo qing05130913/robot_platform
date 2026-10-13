@@ -1,0 +1,9 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pymysql>=1.1
+python-dotenv
+
+# 测试依赖
+requests>=2.31
+pytest>=8
+pytest-html>=4
