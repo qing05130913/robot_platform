@@ -1,960 +1,532 @@
-import os
+"""设备接口测试。
+
+- 权限矩阵通过 username × device_name 参数化，主键由 conftest 的 users/devices
+  fixture 动态解析，不硬编码自增 ID；
+- 数据库校验统一走 conftest 的 db fixture（autocommit 连接 + 游标上下文管理器），
+  避免连接泄漏和「读到旧快照」；
+- 创建的临时设备名带 UUID 后缀，清理用 try/finally，保证失败也能还原；
+- 操作日志列表的权限测试由测试自身造数并验证其出现在结果中，不依赖其他测试。
+"""
+import uuid
 
 import pytest
 
-from config import BASE_URL
-from common.api_client import APIClient
-from backend.database import get_connection
 
-client = APIClient()
-
-# ============================================================
-# 测试数据
-# ============================================================
-
-USERS = [
-    {"token": "token_alice", "user_id": 1, "role": "user"},
-    {"token": "token_bob", "user_id": 2, "role": "user"},
-    {"token": "token_admin", "user_id": 3, "role": "admin"},
-]
-
-DEVICES = [
-    {"device_id": 1, "owner_id": 1},
-    {"device_id": 2, "owner_id": 1},
-    {"device_id": 3, "owner_id": 2},
-]
+USERNAMES = ["alice", "bob", "admin"]
+DEVICE_NAMES = ["Robot-A", "Robot-B", "Robot-C"]
+NONEXISTENT_ID = 999999  # 「必然不存在」的哨兵值，用于 404 用例
 
 
-# ============================================================
-# 权限规则
-# ============================================================
-
-def expected_permission_status(user, device):
-    """
-    根据业务规则判断用户是否有权限访问/操作设备。
-    """
-
+def expected_permission_status(user: dict, device: dict) -> int:
+    """测试侧权限 oracle：admin 任意；普通用户仅自己的设备。"""
     if user["role"] == "admin":
         return 200
-
-    if user["user_id"] == device["owner_id"]:
+    if user["id"] == device["owner_id"]:
         return 200
-
     return 403
 
 
 # ============================================================
-# PyMySQL 数据库工具
+# 数据库辅助函数（统一用 db fixture，游标由 with 自动关闭）
 # ============================================================
 
-def get_operation_log_count():
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        "SELECT COUNT(*) FROM operation_logs"
-    )
-
-    result = cursor.fetchone()
-
-    cursor.close()
-    connection.close()
-
-    return result["COUNT(*)"]
+def _device_status(db, device_id):
+    with db.cursor() as cur:
+        cur.execute("SELECT status FROM devices WHERE id = %s", (device_id,))
+        row = cur.fetchone()
+    return row["status"] if row else None
 
 
-def get_latest_operation_log():
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute("""
-        SELECT user_id, device_id, action
-        FROM operation_logs
-        ORDER BY id DESC
-        LIMIT 1
-    """)
-
-    result = cursor.fetchone()
-
-    cursor.close()
-    connection.close()
-
-    if result is None:
-        return None
-
-    return (result["user_id"], result["device_id"], result["action"])
+def _device_battery(db, device_id):
+    with db.cursor() as cur:
+        cur.execute("SELECT battery FROM devices WHERE id = %s", (device_id,))
+        row = cur.fetchone()
+    return row["battery"] if row else None
 
 
-def get_operation_log_max_id():
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute("SELECT MAX(id) FROM operation_logs")
-
-    result = cursor.fetchone()
-
-    cursor.close()
-    connection.close()
-
-    if result["MAX(id)"] is None:
-        return 0
-
-    return result["MAX(id)"]
+def _restore_device_status(db, device_id, status):
+    with db.cursor() as cur:
+        cur.execute("UPDATE devices SET status = %s WHERE id = %s", (status, device_id))
 
 
-def get_operation_logs_after(log_id):
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT user_id, device_id, action
-        FROM operation_logs
-        WHERE id > %s
-        ORDER BY id
-        """,
-        (log_id,)
-    )
-
-    result = cursor.fetchall()
-
-    cursor.close()
-    connection.close()
-
-    return [(row["user_id"], row["device_id"], row["action"]) for row in result]
+def _restore_device_battery(db, device_id, battery):
+    with db.cursor() as cur:
+        cur.execute("UPDATE devices SET battery = %s WHERE id = %s", (battery, device_id))
 
 
-def get_device_status(device_id):
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT status
-        FROM devices
-        WHERE id = %s
-        """,
-        (device_id,)
-    )
-
-    result = cursor.fetchone()
-
-    cursor.close()
-    connection.close()
-
-    if result is None:
-        return None
-
-    return result["status"]
+def _operation_log_max_id(db):
+    with db.cursor() as cur:
+        cur.execute("SELECT MAX(id) AS m FROM operation_logs")
+        row = cur.fetchone()
+    return row["m"] or 0
 
 
-def get_device_battery(device_id):
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT battery
-        FROM devices
-        WHERE id = %s
-        """,
-        (device_id,)
-    )
-
-    result = cursor.fetchone()
-
-    cursor.close()
-    connection.close()
-
-    if result is None:
-        return None
-
-    return result["battery"]
-
-
-def restore_device_status(device_id, status):
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        UPDATE devices
-        SET status = %s
-        WHERE id = %s
-        """,
-        (status, device_id)
-    )
-
-    connection.commit()
-
-    cursor.close()
-    connection.close()
-
-
-def restore_device_battery(device_id, battery):
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        UPDATE devices
-        SET battery = %s
-        WHERE id = %s
-        """,
-        (battery, device_id)
-    )
-
-    connection.commit()
-
-    cursor.close()
-    connection.close()
+def _operation_logs_after(db, log_id):
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT user_id, device_id, action FROM operation_logs "
+            "WHERE id > %s ORDER BY id",
+            (log_id,),
+        )
+        rows = cur.fetchall()
+    return [(r["user_id"], r["device_id"], r["action"]) for r in rows]
 
 
 # ============================================================
-# GET /devices
+# GET /devices —— 设备列表
 # ============================================================
 
 @pytest.mark.parametrize(
-    "token, expected_status, user_id, role",
+    "token, expected_status, expected_owner",
     [
-        ("token_alice", 200, 1, "user"),
-        ("token_bob", 200, 2, "user"),
-        ("token_admin", 200, None, "admin"),
-        ("token_wrong", 401, None, None),
-    ]
+        ("token_alice", 200, "alice"),
+        ("token_bob", 200, "bob"),
+        ("token_admin", 200, None),  # admin 看全部
+        ("token_wrong", 401, None),
+    ],
 )
-def test_get_devices(
-    token,
-    expected_status,
-    user_id,
-    role
-):
-
-    response = client.get(
-        "/devices",
-        token=token
-    )
+def test_get_devices(token, expected_status, expected_owner, api_client, users):
+    response = api_client.get("/devices", token=token)
 
     assert response.status_code == expected_status
 
     if expected_status == 200:
-
         result = response.json()
-
         assert result["code"] == 0
         assert isinstance(result["data"], list)
 
         devices = result["data"]
-
-        if role == "admin":
-            # 管理员应能看到不同用户的设备（跨属主）
-            owner_ids = {device["owner_id"] for device in devices}
+        if expected_owner is None:
+            # admin 应能跨属主看到多个用户的设备
+            owner_ids = {d["owner_id"] for d in devices}
             assert len(owner_ids) >= 2
         else:
-            # 普通用户只能看到属于自己的设备
+            owner_id = users[expected_owner]["id"]
             assert devices
-            assert all(device["owner_id"] == user_id for device in devices)
+            assert all(d["owner_id"] == owner_id for d in devices)
 
 
 # ============================================================
-# GET /devices/{device_id}
-# 权限测试
+# GET /devices/{device_id} —— 权限矩阵 + 异常
 # ============================================================
 
-@pytest.mark.parametrize("user", USERS)
-@pytest.mark.parametrize("device", DEVICES)
-def test_get_device(user, device):
+@pytest.mark.parametrize("username", USERNAMES)
+@pytest.mark.parametrize("device_name", DEVICE_NAMES)
+def test_get_device(username, device_name, api_client, users, devices):
+    user = users[username]
+    device = devices[device_name]
 
-    expected = expected_permission_status(
-        user,
-        device
-    )
-    device_id = device["device_id"]
+    response = api_client.get(f"/devices/{device['id']}", token=f"token_{username}")
 
-    response = client.get(
-        f"/devices/{device_id}",
-        token = user["token"]
-    )
-
+    expected = expected_permission_status(user, device)
     assert response.status_code == expected
 
     if expected == 200:
-
         result = response.json()
-
         assert result["code"] == 0
-        assert result["data"]["id"] == device_id
+        assert result["data"]["id"] == device["id"]
         assert result["data"]["owner_id"] == device["owner_id"]
 
 
-# ============================================================
-# GET /devices/{device_id}
-# 异常测试
-# ============================================================
-
 @pytest.mark.parametrize(
-    "token, device_id, expected_status",
+    "token, device_ref, expected_status",
     [
-        ("token_wrong", 1, 401),
-        ("token_wrong", 999, 401),
-
-        ("token_alice", 999, 404),
-        ("token_bob", 999, 404),
-        ("token_admin", 999, 404),
-    ]
+        ("token_wrong", "Robot-A", 401),  # 无 token：鉴权先于设备存在性
+        ("token_wrong", None, 401),
+        ("token_alice", None, 404),       # 设备不存在
+        ("token_bob", None, 404),
+        ("token_admin", None, 404),
+    ],
 )
-def test_get_device_abnormal(
-    token,
-    device_id,
-    expected_status
-):
-
-    url = f"/devices/{device_id}"
-
-    response = client.get(
-        url,
-        token=token
-    )
-
+def test_get_device_abnormal(token, device_ref, expected_status, api_client, devices):
+    device_id = devices[device_ref]["id"] if device_ref else NONEXISTENT_ID
+    response = api_client.get(f"/devices/{device_id}", token=token)
     assert response.status_code == expected_status
 
 
 # ============================================================
 # PUT /devices/{device_id}/status
-# 权限测试
 # ============================================================
 
-@pytest.mark.parametrize("user", USERS)
-@pytest.mark.parametrize("device", DEVICES)
-def test_update_device_status_permission(user, device):
+@pytest.mark.parametrize("username", USERNAMES)
+@pytest.mark.parametrize("device_name", DEVICE_NAMES)
+def test_update_device_status_permission(username, device_name, api_client, users, devices, db):
+    user = users[username]
+    device = devices[device_name]
+    device_id = device["id"]
 
-    expected = expected_permission_status(
-        user,
-        device
-    )
-
-    device_id = device["device_id"]
-
-    url = f"/devices/{device_id}/status"
-
-    # 记录被测设备的原始状态，测试结束后恢复，避免权限测试污染种子设备
-    original_status = get_device_status(device_id)
-
+    original_status = _device_status(db, device_id)
     try:
-        response = client.put(
-            url,
-            token = user["token"],
-            json={
-                "status": "offline"
-            }
-        )
-
-        assert response.status_code == expected
-    finally:
-        # 无论断言是否通过都执行：只要状态被改动就还原。
-        # 403/404/422 不会写库，状态未变，不会触发多余的 UPDATE。
-        current_status = get_device_status(device_id)
-        if original_status is not None and current_status != original_status:
-            restore_device_status(device_id, original_status)
-
-
-# ============================================================
-# PUT /devices/{device_id}/status
-# 成功业务链 + 数据库一致性
-# ============================================================
-
-@pytest.mark.parametrize(
-    "token, user_id, device_id, new_status",
-    [
-        ("token_alice", 1, 1, "offline"),
-        ("token_alice", 1, 1, "online"),
-        ("token_bob", 2, 3, "offline"),
-        ("token_admin", 3, 1, "error"),
-    ]
-)
-def test_update_device_status_success(
-    token,
-    user_id,
-    device_id,
-    new_status
-):
-
-    # 记录被测设备的原始状态，以及当前日志最大 id 作为本次日志基准
-    original_status = get_device_status(device_id)
-    max_id_before = get_operation_log_max_id()
-
-    try:
-        # PUT
-        response = client.put(
+        response = api_client.put(
             f"/devices/{device_id}/status",
-            token=token,
-            json={
-                "status": new_status
-            }
+            token=f"token_{username}",
+            json={"status": "offline"},
         )
+        assert response.status_code == expected_permission_status(user, device)
+    finally:
+        current = _device_status(db, device_id)
+        if original_status is not None and current != original_status:
+            _restore_device_status(db, device_id, original_status)
 
-        # HTTP + 业务响应
+
+@pytest.mark.parametrize(
+    "username, device_name, new_status",
+    [
+        ("alice", "Robot-A", "offline"),
+        ("alice", "Robot-A", "online"),
+        ("bob", "Robot-C", "offline"),
+        ("admin", "Robot-A", "error"),
+    ],
+)
+def test_update_device_status_success(username, device_name, new_status, api_client, users, devices, db):
+    user = users[username]
+    device_id = devices[device_name]["id"]
+
+    original_status = _device_status(db, device_id)
+    max_id_before = _operation_log_max_id(db)
+
+    try:
+        response = api_client.put(
+            f"/devices/{device_id}/status",
+            token=f"token_{username}",
+            json={"status": new_status},
+        )
         assert response.status_code == 200
-
         result = response.json()
-
         assert result["code"] == 0
         assert result["data"] is None
 
-        # GET验证设备状态
-        response = client.get(
-            f"/devices/{device_id}",
-            token=token
-        )
-
+        # GET 回读
+        response = api_client.get(f"/devices/{device_id}", token=f"token_{username}")
         assert response.status_code == 200
+        assert response.json()["data"]["status"] == new_status
 
-        result = response.json()
+        # DB 直查
+        assert _device_status(db, device_id) == new_status
 
-        assert result["code"] == 0
-        assert result["data"]["id"] == device_id
-        assert result["data"]["status"] == new_status
-
-        # 数据库验证
-        db_status = get_device_status(device_id)
-
-        assert db_status == new_status
-
-        # 验证本次请求写入的日志：基准 id 之后应恰好新增一条，且字段匹配
-        new_logs = get_operation_logs_after(max_id_before)
-
+        # 操作日志：基准 id 之后应恰好新增一条，且字段匹配
+        new_logs = _operation_logs_after(db, max_id_before)
         assert len(new_logs) == 1
-        assert new_logs[0][0] == user_id
-        assert new_logs[0][1] == device_id
-        assert new_logs[0][2] == "修改设备状态"
+        assert new_logs[0] == (user["id"], device_id, "修改设备状态")
     finally:
-        # 恢复设备原始状态；仅当状态确实变化时才恢复，避免多余 UPDATE
-        current_status = get_device_status(device_id)
-        if original_status is not None and current_status != original_status:
-            restore_device_status(device_id, original_status)
+        current = _device_status(db, device_id)
+        if original_status is not None and current != original_status:
+            _restore_device_status(db, device_id, original_status)
 
-
-# ============================================================
-# PUT /devices/{device_id}/status
-# 异常测试
-# ============================================================
 
 @pytest.mark.parametrize(
-    "token, device_id, status_value, expected_status",
+    "token, device_ref, status_value, expected_status",
     [
-        ("token_wrong", 1, "offline", 401),
-
-        ("token_alice", 999, "offline", 404),
-        ("token_bob", 999, "offline", 404),
-        ("token_admin", 999, "offline", 404),
-
-        ("token_alice", 1, "invalid", 422),
-        ("token_alice", 1, "", 422),
-    ]
+        ("token_wrong", "Robot-A", "offline", 401),
+        ("token_alice", None, "offline", 404),
+        ("token_bob", None, "offline", 404),
+        ("token_admin", None, "offline", 404),
+        ("token_alice", "Robot-A", "invalid", 422),
+        ("token_alice", "Robot-A", "", 422),
+    ],
 )
-def test_update_device_status_abnormal(
-    token,
-    device_id,
-    status_value,
-    expected_status
-):
-
-    url = f"/devices/{device_id}/status"
-
-    response = client.put(
-        url,
+def test_update_device_status_abnormal(token, device_ref, status_value, expected_status, api_client, devices):
+    device_id = devices[device_ref]["id"] if device_ref else NONEXISTENT_ID
+    response = api_client.put(
+        f"/devices/{device_id}/status",
         token=token,
-        json={
-            "status": status_value
-        }
+        json={"status": status_value},
     )
-
     assert response.status_code == expected_status
 
 
 # ============================================================
 # PUT /devices/{device_id}/battery
-# 边界值测试
 # ============================================================
 
 @pytest.mark.parametrize(
-    "token, device_id, battery, expected_status",
+    "battery, expected_status",
     [
-        ("token_alice", 1, 0, 200),
-        ("token_alice", 1, 1, 200),
-        ("token_alice", 1, 99, 200),
-        ("token_alice", 1, 100, 200),
-
-        ("token_alice", 1, -1, 422),
-        ("token_alice", 1, 101, 422),
-        ("token_alice", 1, 50.5, 422),
-        ("token_alice", 1, None, 422),
-    ]
+        (0, 200), (1, 200), (99, 200), (100, 200),         # 边界值：合法
+        (-1, 422), (101, 422), (50.5, 422), (None, 422),   # 越界 / 类型错误
+    ],
 )
-def test_update_device_battery_boundary(
-    token,
-    device_id,
-    battery,
-    expected_status
-):
-
-    url = f"/devices/{device_id}/battery"
-    original_battery = get_device_battery(device_id)
-    try:
-        response = client.put(
-            url,
-            token=token,
-            json={
-                "battery": battery
-            }
-        )
-
-        assert response.status_code == expected_status
-
-    finally:
-        current_battery = get_device_battery(device_id)
-
-        if current_battery != original_battery:
-            restore_device_battery(device_id, original_battery)
-
-# ============================================================
-# PUT /devices/{device_id}/battery
-# 权限测试
-# ============================================================
-
-@pytest.mark.parametrize("user", USERS)
-@pytest.mark.parametrize("device", DEVICES)
-def test_update_device_battery_permission(user, device):
-
-    expected = expected_permission_status(
-        user,
-        device
-    )
-
-    device_id = device["device_id"]
-
-    url = f"/devices/{device_id}/battery"
-
-    # 记录被测设备的原始电量，测试结束后恢复，避免权限测试污染种子设备。
-    # 若读取失败（数据库异常）会直接抛出，不会被当作“无需恢复”。
-    original_battery = get_device_battery(device_id)
+def test_update_device_battery_boundary(battery, expected_status, api_client, devices, db):
+    device_id = devices["Robot-A"]["id"]
+    original_battery = _device_battery(db, device_id)
 
     try:
-        response = client.put(
-            url,
-            token = user["token"],
-            json={
-                "battery": 50
-            }
-        )
-
-        assert response.status_code == expected
-    finally:
-        # 仅当原始电量读取成功（非 None）且当前电量确实变化时才恢复；
-        # 403/404/422 不会写库，电量未变，不会触发多余 UPDATE。
-        current_battery = get_device_battery(device_id)
-        if original_battery is not None and current_battery != original_battery:
-            restore_device_battery(device_id, original_battery)
-
-
-# ============================================================
-# PUT /devices/{device_id}/battery
-# 成功业务链 + 数据库一致性
-# ============================================================
-
-@pytest.mark.parametrize(
-    "token, user_id, device_id, new_battery",
-    [
-        ("token_alice", 1, 1, 0),
-        ("token_alice", 1, 1, 100),
-        ("token_bob", 2, 3, 50),
-        ("token_admin", 3, 1, 80),
-        
-    ]
-)
-def test_update_device_battery_success(
-    token,
-    user_id,
-    device_id,
-    new_battery
-):
-
-    # 记录被测设备的原始电量，以及当前日志最大 id 作为本次日志基准
-    original_battery = get_device_battery(device_id)
-    max_id_before = get_operation_log_max_id()
-
-    try:
-        # PUT修改电量
-        response = client.put(
+        response = api_client.put(
             f"/devices/{device_id}/battery",
-            token=token,
-            json={
-                "battery": new_battery
-            }
+            token="token_alice",
+            json={"battery": battery},
         )
+        assert response.status_code == expected_status
+    finally:
+        current = _device_battery(db, device_id)
+        if original_battery is not None and current != original_battery:
+            _restore_device_battery(db, device_id, original_battery)
 
-        # HTTP + 业务响应
+
+@pytest.mark.parametrize("username", USERNAMES)
+@pytest.mark.parametrize("device_name", DEVICE_NAMES)
+def test_update_device_battery_permission(username, device_name, api_client, users, devices, db):
+    user = users[username]
+    device = devices[device_name]
+    device_id = device["id"]
+
+    original_battery = _device_battery(db, device_id)
+    try:
+        response = api_client.put(
+            f"/devices/{device_id}/battery",
+            token=f"token_{username}",
+            json={"battery": 50},
+        )
+        assert response.status_code == expected_permission_status(user, device)
+    finally:
+        current = _device_battery(db, device_id)
+        if original_battery is not None and current != original_battery:
+            _restore_device_battery(db, device_id, original_battery)
+
+
+@pytest.mark.parametrize(
+    "username, device_name, new_battery",
+    [
+        ("alice", "Robot-A", 0),
+        ("alice", "Robot-A", 100),
+        ("bob", "Robot-C", 50),
+        ("admin", "Robot-A", 80),
+    ],
+)
+def test_update_device_battery_success(username, device_name, new_battery, api_client, users, devices, db):
+    user = users[username]
+    device_id = devices[device_name]["id"]
+
+    original_battery = _device_battery(db, device_id)
+    max_id_before = _operation_log_max_id(db)
+
+    try:
+        response = api_client.put(
+            f"/devices/{device_id}/battery",
+            token=f"token_{username}",
+            json={"battery": new_battery},
+        )
         assert response.status_code == 200
-
         result = response.json()
-
         assert result["code"] == 0
         assert result["data"] is None
 
-        # GET验证电量
-        response = client.get(
-            f"/devices/{device_id}",
-            token=token
-        )
-
+        # GET 回读
+        response = api_client.get(f"/devices/{device_id}", token=f"token_{username}")
         assert response.status_code == 200
+        assert response.json()["data"]["battery"] == new_battery
 
-        result = response.json()
+        # DB 直查
+        assert _device_battery(db, device_id) == new_battery
 
-        assert result["code"] == 0
-        assert result["data"]["id"] == device_id
-        assert result["data"]["battery"] == new_battery
-
-        # 数据库验证
-        db_battery = get_device_battery(device_id)
-
-        assert db_battery == new_battery
-
-        # 验证本次请求写入的日志：基准 id 之后应恰好新增一条，且字段匹配
-        new_logs = get_operation_logs_after(max_id_before)
-
+        # 操作日志：基准 id 之后应恰好新增一条，且字段匹配
+        new_logs = _operation_logs_after(db, max_id_before)
         assert len(new_logs) == 1
-        assert new_logs[0][0] == user_id
-        assert new_logs[0][1] == device_id
-        assert new_logs[0][2] == "修改设备电量"
+        assert new_logs[0] == (user["id"], device_id, "修改设备电量")
     finally:
-        # 恢复设备原始电量；仅当电量确实变化时才恢复，避免多余 UPDATE
-        current_battery = get_device_battery(device_id)
-        if original_battery is not None and current_battery != original_battery:
-            restore_device_battery(device_id, original_battery)
+        current = _device_battery(db, device_id)
+        if original_battery is not None and current != original_battery:
+            _restore_device_battery(db, device_id, original_battery)
 
-
-# ============================================================
-# PUT /devices/{device_id}/battery
-# 异常测试
-# ============================================================
 
 @pytest.mark.parametrize(
-    "token, device_id, battery, expected_status",
+    "token, device_ref, battery, expected_status",
     [
-        # Token错误
-        ("token_wrong", 1, 50, 401),
-
-        # 设备不存在
-        ("token_alice", 999, 50, 404),
-        ("token_bob", 999, 50, 404),
-        ("token_admin", 999, 50, 404),
-
-        # 电量越界
-        ("token_alice", 1, -1, 422),
-        ("token_alice", 1, 101, 422),
-    ]
+        ("token_wrong", "Robot-A", 50, 401),
+        ("token_alice", None, 50, 404),
+        ("token_bob", None, 50, 404),
+        ("token_admin", None, 50, 404),
+        ("token_alice", "Robot-A", -1, 422),
+        ("token_alice", "Robot-A", 101, 422),
+    ],
 )
-def test_update_device_battery_abnormal(
-    token,
-    device_id,
-    battery,
-    expected_status
-):
-
-    url = f"/devices/{device_id}/battery"
-
-    response = client.put(
-        url,
+def test_update_device_battery_abnormal(token, device_ref, battery, expected_status, api_client, devices):
+    device_id = devices[device_ref]["id"] if device_ref else NONEXISTENT_ID
+    response = api_client.put(
+        f"/devices/{device_id}/battery",
         token=token,
-        json={
-            "battery": battery
-        }
+        json={"battery": battery},
     )
-
     assert response.status_code == expected_status
+
+
 # ============================================================
 # GET /operation-logs
 # ============================================================
 
-@pytest.mark.parametrize("user", USERS)
-def test_get_operation_logs(user):
+@pytest.fixture()
+def operation_log_marker(db, users, devices):
+    """为 /operation-logs 权限测试准备两条不同用户的操作日志，返回唯一标记。
 
-    response = client.get(
-        "/operation-logs",
-        token = user["token"]
-    )
-    assert response.status_code ==200
-    result=response.json()
+    该用例只验证「列表接口的权限过滤」，不验证日志产生逻辑（后者由 status/battery
+    的成功用例覆盖），因此直接向 operation_logs 造数并带唯一标记，测试结束删除。
+    """
+    alice_id = users["alice"]["id"]
+    bob_id = users["bob"]["id"]
+    device_id = devices["Robot-A"]["id"]
+    marker = f"权限测试-{uuid.uuid4().hex[:8]}"
+
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO operation_logs (user_id, device_id, action) VALUES (%s, %s, %s), (%s, %s, %s)",
+            (alice_id, device_id, marker, bob_id, device_id, marker),
+        )
+
+    yield marker
+
+    with db.cursor() as cur:
+        cur.execute("DELETE FROM operation_logs WHERE action = %s", (marker,))
+
+
+@pytest.mark.parametrize("username", USERNAMES)
+def test_get_operation_logs(operation_log_marker, username, api_client, users):
+    user = users[username]
+    marker = operation_log_marker
+
+    response = api_client.get("/operation-logs", token=f"token_{username}")
+
+    assert response.status_code == 200
+    result = response.json()
     assert result["code"] == 0
 
-    if user["role"]!="admin":
-        for log in result["data"]:
-            assert log["user_id"]==user["user_id"]
+    logs = result["data"]
+    # 本次测试准备的数据确实出现在返回结果中
+    seeded = [log for log in logs if log["action"] == marker]
+    assert seeded, "本次准备的操作日志未出现在返回结果中"
+
+    if user["role"] != "admin":
+        # 普通用户：只能看到自己的日志
+        for log in logs:
+            assert log["user_id"] == user["id"]
     else:
-        user_ids = {log["user_id"] for log in result["data"]}
-        assert len(user_ids) >= 2
-
-def test_get_operation_logs_invalid_token():
+        # admin：能看到所有用户，本次准备的 alice + bob 两条日志都可见
+        assert {log["user_id"] for log in seeded} == {users["alice"]["id"], users["bob"]["id"]}
 
 
-    response = client.get(
-        "/operation-logs",
-        token="token_wrong"
-    )
+def test_get_operation_logs_invalid_token(api_client):
+    response = api_client.get("/operation-logs", token="token_wrong")
 
     assert response.status_code == 401
+    assert response.json()["code"] != 0
 
-    result = response.json()
-
-    assert result["code"] !=0
 
 # ============================================================
-# DELETE /devices/{device-id}
+# DELETE /devices/{device_id}
 # ============================================================
 
-
-# 测试不同用户删除设备时的权限
 @pytest.mark.parametrize(
-    "create_token, delete_token, expected_status",
+    "create_username, delete_username, expected_status",
     [
-        # Alice 创建，Alice 删除 → 有权限
-        ("token_alice", "token_alice", 200),
-
-        # Alice 创建，Admin 删除 → 有权限
-        ("token_alice", "token_admin", 200),
-
-        # Alice 创建，Bob 删除 → 无权限
-        ("token_alice", "token_bob", 403),
-    ]
+        ("alice", "alice", 200),  # 属主删除
+        ("alice", "admin", 200),  # admin 删除
+        ("alice", "bob", 403),    # 非属主删除
+    ],
 )
-def test_delete_device_permission(
-    create_token,
-    delete_token,
-    expected_status
-):
-    
+def test_delete_device_permission(create_username, delete_username, expected_status, api_client):
     device_id = None
+    device_name = f"Robot-Del-{uuid.uuid4().hex[:8]}"
+
     try:
-        # 先创建一个测试设备
-        create_response = client.post(
+        create_response = api_client.post(
             "/devices",
-            token=create_token,
-            json={
-                "name": "Robot-Delete-Permission-Test",
-                "status": "offline",
-                "battery": 80
-            }
+            token=f"token_{create_username}",
+            json={"name": device_name, "status": "offline", "battery": 80},
         )
-
         assert create_response.status_code == 200
-
-        # 获取刚创建的设备 ID
         device_id = create_response.json()["data"]["id"]
 
-        # 尝试删除设备
-        response = client.delete(
-            f"/devices/{device_id}",
-            token=delete_token
-        )
-
-        # 验证 HTTP 状态码
+        response = api_client.delete(f"/devices/{device_id}", token=f"token_{delete_username}")
         assert response.status_code == expected_status
 
         if expected_status == 200:
-
-            # 删除成功后，设备应该不存在
-            response = client.get(
-                f"/devices/{device_id}",
-                token=delete_token
-            )
-
-            assert response.status_code == 404
-
-            result = response.json()
-            assert result["code"] != 0
-
+            check = api_client.get(f"/devices/{device_id}", token=f"token_{delete_username}")
+            assert check.status_code == 404
         else:
-
-            # 删除失败后，设备应该仍然存在
-            response =client.get(
-                f"/devices/{device_id}",
-                token=create_token
-            )
-
-            assert response.status_code == 200
-
-            result = response.json()
-            assert result["code"] == 0
-
+            check = api_client.get(f"/devices/{device_id}", token=f"token_{create_username}")
+            assert check.status_code == 200
     finally:
         if device_id is not None:
-            check_response = client.get(
-                f"/devices/{device_id}",
-                token="token_admin"
-            )
+            check = api_client.get(f"/devices/{device_id}", token="token_admin")
+            if check.status_code == 200:
+                cleanup = api_client.delete(f"/devices/{device_id}", token="token_admin")
+                assert cleanup.status_code == 200
 
-            if check_response.status_code == 200:
-                cleanup_response = client.delete(
-                    f"/devices/{device_id}",
-                    token="token_admin"
-                )
-                assert cleanup_response.status_code == 200
 
-# 测试错误 Token
-def test_delete_device_invalid_token():
-
-    response = client.delete(
-        "/devices/1",
-        token="token_wrong"
-    )
-
-    # 错误 Token 应该返回 401
+def test_delete_device_invalid_token(api_client, devices):
+    response = api_client.delete(f"/devices/{devices['Robot-A']['id']}", token="token_wrong")
     assert response.status_code == 401
 
 
-# 测试删除不存在的设备
-def test_delete_device_not_found():
-
-    response = client.delete(
-        "/devices/99999",
-        token="token_admin"
-    )
-
-    # 不存在的设备应该返回 404
+def test_delete_device_not_found(api_client):
+    response = api_client.delete(f"/devices/{NONEXISTENT_ID}", token="token_admin")
     assert response.status_code == 404
+    assert response.json()["code"] != 0
 
-    result = response.json()
-    assert result["code"] != 0
 
 # ============================================================
 # POST /devices
 # ============================================================
 
+@pytest.mark.parametrize("username", USERNAMES)
+def test_create_device(username, api_client, users):
+    device_id = None
+    device_name = f"Robot-Test-{username}-{uuid.uuid4().hex[:8]}"
 
-# 正常创建设备
-# Alice、Bob、Admin 都应该可以创建
-@pytest.mark.parametrize(
-    "token, owner_id, device_name",
-    [
-        ("token_alice", 1, "Robot-Test-A"),
-        ("token_bob", 2, "Robot-Test-B"),
-        ("token_admin", 3, "Robot-Test-Admin"),
-    ]
-)
-def test_create_device(token, owner_id, device_name):
-
-    device_id=None
     try:
-        # POST 请求创建设备
-        response = client.post(
+        response = api_client.post(
             "/devices",
-            token=token,
-            json={
-                "name": device_name,
-                "status": "offline",
-                "battery": 80
-            }
+            token=f"token_{username}",
+            json={"name": device_name, "status": "offline", "battery": 80},
         )
-
-        # 验证创建成功
         assert response.status_code == 200
-
         result = response.json()
         assert result["code"] == 0
-
-        # 获取新创建的设备 ID
         device_id = result["data"]["id"]
 
-        # 创建成功后，通过 GET 查询设备
-        response = client.get(
-            f"/devices/{device_id}",
-            token=token
-        )
-
-        # 验证查询成功
+        # GET 回读并校验设备归属
+        response = api_client.get(f"/devices/{device_id}", token=f"token_{username}")
         assert response.status_code == 200
-
-        result = response.json()
-        data = result["data"]
-
-        # 验证设备信息
+        data = response.json()["data"]
         assert data["name"] == device_name
-        assert data["owner_id"] == owner_id
+        assert data["owner_id"] == users[username]["id"]
         assert data["status"] == "offline"
         assert data["battery"] == 80
-
     finally:
         if device_id is not None:
-            cleanup_response = client.delete(
-                f"/devices/{device_id}",
-                token="token_admin"
-            )
-            assert cleanup_response.status_code in (200, 404)
+            cleanup = api_client.delete(f"/devices/{device_id}", token="token_admin")
+            assert cleanup.status_code == 200
 
 
-# 测试错误 Token 不能创建设备
-def test_create_device_invalid_token():
-
-    response = client.post(
+def test_create_device_invalid_token(api_client):
+    response = api_client.post(
         "/devices",
         token="token_wrong",
-        json={
-            "name": "Robot-Test-Wrong",
-            "status": "offline",
-            "battery": 80
-        }
+        json={"name": "Robot-Test-Wrong", "status": "offline", "battery": 80},
     )
-
-    # 错误 Token 应该返回 401
     assert response.status_code == 401
 
 
-# 测试重复设备名称
-def test_create_device_duplicate_name():
-    device_id=None
-    device_name = "Robot-Duplicate"
+def test_create_device_duplicate_name(api_client):
+    device_id = None
+    device_name = f"Robot-Dup-{uuid.uuid4().hex[:8]}"
+
     try:
-        # 先创建一个设备，准备重复名称的测试数据
-        response = client.post(
+        response = api_client.post(
             "/devices",
             token="token_alice",
-            json={
-                "name": device_name,
-                "status": "offline",
-                "battery": 80
-            }
+            json={"name": device_name, "status": "offline", "battery": 80},
         )
-
-        # 确保前置设备创建成功
         assert response.status_code == 200
-
-        # 获取第一次创建的设备 ID
         device_id = response.json()["data"]["id"]
 
-        # 再次使用相同名称创建
-        response = client.post(
+        response = api_client.post(
             "/devices",
             token="token_alice",
-            json={
-                "name": device_name,
-                "status": "offline",
-                "battery": 80
-            }
+            json={"name": device_name, "status": "offline", "battery": 80},
         )
-
-        # 重复名称应该返回 400
         assert response.status_code == 400
-
-        result = response.json()
-
-        # 验证业务错误码
-        assert result["code"] == 400
-
+        assert response.json()["code"] == 400
     finally:
         if device_id is not None:
-            cleanup_response = client.delete(
-                f"/devices/{device_id}",
-                token="token_admin"
-            )
-            assert cleanup_response.status_code in (200, 404)
+            cleanup = api_client.delete(f"/devices/{device_id}", token="token_admin")
+            assert cleanup.status_code == 200

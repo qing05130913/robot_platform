@@ -1,130 +1,100 @@
-import requests
+"""用户接口测试。
+
+权限矩阵通过 username（业务键）参数化，主键由 conftest 的 users fixture
+在运行时从数据库解析，不硬编码自增 ID。
+"""
 import pytest
 
-from common.api_client import APIClient
-
-client = APIClient()
-
-# =========================
-# 测试数据
-# =========================
-
-USERS = [
-    {"username": "alice", "user_id": 1, "role": "user"},
-    {"username": "bob", "user_id": 2, "role": "user"},
-    {"username": "admin", "user_id": 3, "role": "admin"},
-]
+# 只保留业务键；user_id / role / status 由 conftest.users 动态解析。
+USERNAMES = ["alice", "bob", "admin"]
 
 
-# =========================
-# 测试侧权限规则
-# =========================
-
-def expected_user_access_status(current_user, target_user_id):
-    """
-    测试侧业务规则：
-    admin 可以访问任意用户；
-    普通用户只能访问自己的信息。
-    """
-
+def expected_user_access_status(current_user: dict, target_user_id: int) -> int:
+    """测试侧权限 oracle：admin 任意；普通用户仅自己。"""
     if current_user["role"] == "admin":
         return 200
-
-    if current_user["user_id"] == target_user_id:
-        return 200
-
-    return 403
-
-def expected_list_users_status(user):
-    if user["role"]=="admin":
+    if current_user["id"] == target_user_id:
         return 200
     return 403
 
 
+def expected_list_users_status(user: dict) -> int:
+    return 200 if user["role"] == "admin" else 403
+
+
 # =========================
-# GET /user
+# GET /user —— 当前登录用户信息
 # =========================
 
-@pytest.mark.parametrize(
-    "token, expected_status, expected_user_id, expected_username",
-    [
-        ("token_alice", 200, 1, "alice"),
-        ("token_bob", 200, 2, "bob"),
-        ("token_wrong", 401, None, None),
-        ("token_nobody", 401, None, None),
-    ]
-)
-def test_get_current_user(token, expected_status, expected_user_id, expected_username):
+@pytest.mark.parametrize("username", ["alice", "bob"])
+def test_get_current_user(username, api_client, users):
+    user = users[username]
 
-    response = client.get("/user",
-                            token=token)
+    response = api_client.get("/user", token=f"token_{username}")
 
-    assert response.status_code == expected_status
+    assert response.status_code == 200
+    result = response.json()
+    assert result["code"] == 0
+    assert result["data"]["user_id"] == user["id"]
+    assert result["data"]["username"] == username
 
-    if response.status_code == 200:
+
+@pytest.mark.parametrize("token", ["token_wrong", "token_nobody"])
+def test_get_current_user_invalid_token(token, api_client):
+    response = api_client.get("/user", token=token)
+    assert response.status_code == 401
+
+
+# =========================
+# GET /users/{user_id} —— 权限矩阵（3 用户 × 3 目标）
+# =========================
+
+@pytest.mark.parametrize("username", USERNAMES)
+@pytest.mark.parametrize("target_username", USERNAMES)
+def test_get_user_permission(username, target_username, api_client, users):
+    current_user = users[username]
+    target_user = users[target_username]
+
+    response = api_client.get(f"/users/{target_user['id']}", token=f"token_{username}")
+
+    expected = expected_user_access_status(current_user, target_user["id"])
+    assert response.status_code == expected
+
+    if expected == 200:
         result = response.json()
-
         assert result["code"] == 0
-        assert result["data"]["user_id"] == expected_user_id
-        assert result["data"]["username"] == expected_username
-
-
-# =========================
-# GET /users/{user_id}
-# 权限矩阵自动生成
-# =========================
-
-@pytest.mark.parametrize("current_user", USERS)
-@pytest.mark.parametrize("target_user_id", [1, 2, 3])
-def test_get_user_permission(current_user, target_user_id):
-
-    token = f"token_{current_user['username']}"
-
-
-    response = client.get(f"/users/{target_user_id}", 
-                          token = f"token_{current_user['username']}")
-
-    expected_status = expected_user_access_status(
-        current_user,
-        target_user_id
-    )
-
-    assert response.status_code == expected_status
-
-    if response.status_code == 200:
-        result = response.json()
-
-        assert result["code"] == 0
-        assert result["data"]["user_id"] == target_user_id
+        assert result["data"]["user_id"] == target_user["id"]
 
 
 # =========================
 # 不存在的用户
 # =========================
 
-def test_get_nonexistent_user():
-
-    response = client.get("/users/999",
-                             token="token_admin")
-
+def test_get_nonexistent_user(api_client, users):
+    # 用「当前最大用户 ID + 1000」作为必然不存在的哨兵值，避免魔法数字。
+    nonexistent_id = max(u["id"] for u in users.values()) + 1000
+    response = api_client.get(f"/users/{nonexistent_id}", token="token_admin")
     assert response.status_code == 404
 
 
-@pytest.mark.parametrize("current_user", USERS)
-def test_get_users(current_user):
-    
-    response = client.get("/users", 
-                            token = f"token_{current_user['username']}")
-    expected_status=expected_list_users_status(current_user)
-    assert response.status_code == expected_status
+# =========================
+# GET /users —— 仅 admin
+# =========================
 
-    if response.status_code == 200:
+@pytest.mark.parametrize("username", USERNAMES)
+def test_get_users(username, api_client, users):
+    current_user = users[username]
+
+    response = api_client.get("/users", token=f"token_{username}")
+
+    expected = expected_list_users_status(current_user)
+    assert response.status_code == expected
+
+    if expected == 200:
         result = response.json()
-
         assert isinstance(result["data"], list)
         assert len(result["data"]) > 0
 
-        if current_user["role"] == "admin":
-            user_ids = {user["user_id"] for user in result["data"]}
-            expected_user_ids = {user["user_id"] for user in USERS}
-            assert user_ids == expected_user_ids
+        user_ids = {u["user_id"] for u in result["data"]}
+        expected_ids = {u["id"] for u in users.values()}
+        assert user_ids == expected_ids
