@@ -48,7 +48,8 @@ class DeviceUpdateResponse(BaseModel):
 class OperationLogInfo(BaseModel):
     id: int
     user_id: int
-    device_id: int
+    device_id: Optional[int] = None
+    device_name: Optional[str] = None
     action: str
     created_at: datetime
 

@@ -463,6 +463,66 @@ def test_delete_device_not_found(api_client):
     assert response.json()["code"] != 0
 
 
+def test_delete_device_preserves_operation_logs(api_client, users, db):
+    """删除设备后，其历史操作日志应保留（device_id 置空、device_name 快照仍在）。"""
+    device_name = f"Robot-Del-Log-{uuid.uuid4().hex[:8]}"
+    device_id = None
+
+    try:
+        # 创建测试设备
+        r = api_client.post(
+            "/devices",
+            token="token_alice",
+            json={"name": device_name, "status": "offline", "battery": 80},
+        )
+        assert r.status_code == 200
+        device_id = r.json()["data"]["id"]
+
+        # 修改状态 → 产生一条操作日志（含 device_name 快照）
+        r = api_client.put(
+            f"/devices/{device_id}/status", token="token_alice", json={"status": "online"}
+        )
+        assert r.status_code == 200
+
+        # 删除设备
+        r = api_client.delete(f"/devices/{device_id}", token="token_alice")
+        assert r.status_code == 200
+
+        # 设备已不存在
+        r = api_client.get(f"/devices/{device_id}", token="token_alice")
+        assert r.status_code == 404
+
+        # 历史日志仍存在：device_id 置空、device_name 快照保留、操作者/动作/时间完整
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT user_id, device_id, device_name, action, created_at "
+                "FROM operation_logs WHERE device_name = %s",
+                (device_name,),
+            )
+            rows = cur.fetchall()
+        assert len(rows) == 1
+        log = rows[0]
+        assert log["device_id"] is None
+        assert log["device_name"] == device_name
+        assert log["user_id"] == users["alice"]["id"]
+        assert log["action"] == "修改设备状态"
+        assert log["created_at"] is not None
+
+        # 日志查询接口仍能正常返回（admin 能查到这条 device_id 为空的日志）
+        r = api_client.get("/operation-logs", token="token_admin")
+        assert r.status_code == 200
+        device_names = {x["device_name"] for x in r.json()["data"]}
+        assert device_name in device_names
+    finally:
+        # 清理本测试产生的孤儿日志；设备若未删成功也兜底清理
+        with db.cursor() as cur:
+            cur.execute("DELETE FROM operation_logs WHERE device_name = %s", (device_name,))
+        if device_id is not None:
+            check = api_client.get(f"/devices/{device_id}", token="token_admin")
+            if check.status_code == 200:
+                api_client.delete(f"/devices/{device_id}", token="token_admin")
+
+
 # ============================================================
 # POST /devices
 # ============================================================
@@ -504,6 +564,26 @@ def test_create_device_invalid_token(api_client):
         json={"name": "Robot-Test-Wrong", "status": "offline", "battery": 80},
     )
     assert response.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "name, status, battery",
+    [
+        ("", "offline", 80),                # 空名称
+        ("x" * 101, "offline", 80),         # 名称超长（>100）
+        ("Robot-Invalid", "invalid", 80),   # 非法状态
+        ("Robot-Invalid", "offline", -1),   # 电量越界（<0）
+        ("Robot-Invalid", "offline", 101),  # 电量越界（>100）
+    ],
+)
+def test_create_device_validation(name, status, battery, api_client):
+    """创建设备参数校验：非法名称/状态/电量应返回 422。"""
+    response = api_client.post(
+        "/devices",
+        token="token_alice",
+        json={"name": name, "status": status, "battery": battery},
+    )
+    assert response.status_code == 422
 
 
 def test_create_device_duplicate_name(api_client):

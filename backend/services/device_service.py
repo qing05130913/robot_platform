@@ -69,17 +69,22 @@ def get_device_by_name(name: str) -> Optional[dict]:
 
 
 def update_device_status(device_id: int, status: str, user_id: int) -> None:
-    """修改设备状态，并写入一条操作日志（同一事务）。"""
+    """修改设备状态，并写入一条操作日志（含设备名称快照，同一事务）。"""
     connection = get_connection()
     try:
         with connection.cursor() as cursor:
+            cursor.execute("SELECT name FROM devices WHERE id = %s", (device_id,))
+            row = cursor.fetchone()
+            device_name = row["name"] if row else None
+
             cursor.execute(
                 "UPDATE devices SET status = %s WHERE id = %s",
                 (status, device_id),
             )
             cursor.execute(
-                "INSERT INTO operation_logs (user_id, device_id, action) VALUES (%s, %s, %s)",
-                (user_id, device_id, "修改设备状态"),
+                "INSERT INTO operation_logs (user_id, device_id, device_name, action) "
+                "VALUES (%s, %s, %s, %s)",
+                (user_id, device_id, device_name, "修改设备状态"),
             )
         connection.commit()
     finally:
@@ -87,17 +92,22 @@ def update_device_status(device_id: int, status: str, user_id: int) -> None:
 
 
 def update_device_battery(device_id: int, battery: int, user_id: int) -> None:
-    """修改设备电量，并写入一条操作日志（同一事务）。"""
+    """修改设备电量，并写入一条操作日志（含设备名称快照，同一事务）。"""
     connection = get_connection()
     try:
         with connection.cursor() as cursor:
+            cursor.execute("SELECT name FROM devices WHERE id = %s", (device_id,))
+            row = cursor.fetchone()
+            device_name = row["name"] if row else None
+
             cursor.execute(
                 "UPDATE devices SET battery = %s WHERE id = %s",
                 (battery, device_id),
             )
             cursor.execute(
-                "INSERT INTO operation_logs (user_id, device_id, action) VALUES (%s, %s, %s)",
-                (user_id, device_id, "修改设备电量"),
+                "INSERT INTO operation_logs (user_id, device_id, device_name, action) "
+                "VALUES (%s, %s, %s, %s)",
+                (user_id, device_id, device_name, "修改设备电量"),
             )
         connection.commit()
     finally:
@@ -121,12 +131,16 @@ def create_device(name: str, owner_id: int, status: str, battery: int) -> dict:
 
 
 def delete_device(device_id: int) -> None:
-    """删除设备，并先删除其操作日志（operation_logs 外键引用 devices）。"""
+    """删除设备，但保留其历史操作日志。
+
+    将关联日志的 device_id 置空（保留 device_name 快照），再删除设备，
+    避免历史审计记录随设备一起丢失。
+    """
     connection = get_connection()
     try:
         with connection.cursor() as cursor:
             cursor.execute(
-                "DELETE FROM operation_logs WHERE device_id = %s",
+                "UPDATE operation_logs SET device_id = NULL WHERE device_id = %s",
                 (device_id,),
             )
             cursor.execute(
@@ -145,12 +159,12 @@ def list_operation_logs(user_id: Optional[int] = None) -> list:
         with connection.cursor() as cursor:
             if user_id is None:
                 cursor.execute(
-                    "SELECT id, user_id, device_id, action, created_at "
+                    "SELECT id, user_id, device_id, device_name, action, created_at "
                     "FROM operation_logs ORDER BY id DESC"
                 )
             else:
                 cursor.execute(
-                    "SELECT id, user_id, device_id, action, created_at "
+                    "SELECT id, user_id, device_id, device_name, action, created_at "
                     "FROM operation_logs WHERE user_id = %s ORDER BY id DESC",
                     (user_id,),
                 )
@@ -162,6 +176,7 @@ def list_operation_logs(user_id: Optional[int] = None) -> list:
             "id": row["id"],
             "user_id": row["user_id"],
             "device_id": row["device_id"],
+            "device_name": row["device_name"],
             "action": row["action"],
             "created_at": row["created_at"],
         }

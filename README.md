@@ -30,9 +30,9 @@ backend-demo/
 │       └── auth.py             # Token 生成/解析、当前用户依赖
 │
 ├── sql/
-│   ├── init.sql                    # 创建数据库及核心表
+│   ├── init.sql                    # 创建数据库及核心表（唯一初始化入口）
 │   ├── test_data.sql               # 基础测试数据
-│   └── migrate_device_module.sql   # 设备模块表结构迁移（已初始化数据库使用）
+│   └── migrate_operation_logs.sql  # 操作日志表迁移（旧库升级，保留历史日志）
 │
 ├── requirements.txt            # Python 依赖
 └── README.md
@@ -70,17 +70,18 @@ $env:DB_PASSWORD = "你的MySQL密码"
 
 ## 初始化 MySQL
 
-首次初始化：
+从零初始化（`init.sql` 是唯一入口，主键统一为 INT）：
 
 ```bash
 mysql -u root -p < sql/init.sql
 mysql -u root -p < sql/test_data.sql
 ```
 
-如果数据库已按上一阶段初始化过，执行迁移脚本重建设备相关表即可（保留 users 与 login_logs）：
+若已存在旧库，且 `operation_logs` 尚无 `device_name` 列 / `device_id` 不可空，
+执行一次迁移即可（不删除任何数据）：
 
 ```bash
-mysql -u root -p < sql/migrate_device_module.sql
+mysql -u root -p robot_platform < sql/migrate_operation_logs.sql
 ```
 
 ## 启动 FastAPI
