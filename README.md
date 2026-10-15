@@ -1,40 +1,53 @@
-# Robot Platform Backend
+# Robot Platform 接口自动化测试项目
 
-机器人管理平台后端服务（第四阶段：设备模块）。
+机器人设备管理平台——一个用于学习接口自动化测试的项目。FastAPI 后端是被测系统（SUT），
+测试侧使用 Python + requests + pytest + MySQL + PyMySQL，覆盖正常、异常、边界、权限与数据库一致性场景。
 
 ## 项目结构
 
 ```text
 backend-demo/
 │
-├── backend/
-│   ├── main.py                 # FastAPI 应用入口，注册路由并统一异常响应格式
-│   ├── database.py             # MySQL 连接配置与连接工厂
-│   ├── routers/
-│   │   ├── __init__.py
-│   │   ├── auth.py             # 登录接口路由
-│   │   ├── users.py            # 用户接口路由
-│   │   └── devices.py          # 设备接口路由
-│   ├── schemas/
-│   │   ├── __init__.py
-│   │   ├── auth.py             # 登录请求/响应模型
-│   │   ├── user.py             # 用户响应模型
-│   │   └── device.py           # 设备请求/响应模型
-│   ├── services/
-│   │   ├── __init__.py
-│   │   ├── auth_service.py     # 登录业务逻辑
-│   │   ├── user_service.py     # 用户查询业务逻辑
-│   │   └── device_service.py   # 设备查询/更新、操作日志业务逻辑
+├── backend/                      # 被测系统（SUT）
+│   ├── main.py                   # FastAPI 入口，注册路由 + 统一异常响应
+│   ├── database.py               # MySQL 连接配置与连接工厂
+│   ├── routers/                  # 路由层
+│   │   ├── auth.py               # 登录
+│   │   ├── users.py              # 用户
+│   │   ├── devices.py            # 设备
+│   │   ├── login_logs.py         # 登录日志
+│   │   └── admin.py              # 管理员
+│   ├── schemas/                  # Pydantic 请求/响应模型
+│   ├── services/                 # 业务逻辑层
+│   │   ├── auth_service.py
+│   │   ├── user_service.py
+│   │   ├── device_service.py
+│   │   ├── login_log_service.py
+│   │   └── admin_service.py
 │   └── utils/
-│       ├── __init__.py
-│       └── auth.py             # Token 生成/解析、当前用户依赖
+│       └── auth.py               # Token 生成/解析、当前用户依赖
 │
-├── sql/
-│   ├── init.sql                    # 创建数据库及核心表（唯一初始化入口）
-│   ├── test_data.sql               # 基础测试数据
-│   └── migrate_operation_logs.sql  # 操作日志表迁移（旧库升级，保留历史日志）
+├── common/                       # 测试公共工具
+│   ├── api_client.py             # requests 封装（Token、超时、日志）
+│   └── logger.py                 # 日志配置（文件轮转 + 控制台）
 │
-├── requirements.txt            # Python 依赖
+├── tests/                        # 测试用例
+│   ├── conftest.py               # fixture：api_client / db / users / devices
+│   ├── test_login.py
+│   ├── test_user.py
+│   ├── test_device.py
+│   ├── test_log.py
+│   └── test_admin.py
+│
+├── sql/                          # 数据库脚本
+│   ├── init.sql                  # 建库建表（唯一初始化入口）
+│   ├── test_data.sql             # 基础种子数据
+│   └── migrate_operation_logs.sql # 旧库升级（保留历史日志）
+│
+├── config.py                     # 测试侧环境变量（BASE_URL / TIMEOUT）
+├── pytest.ini                    # pytest 配置
+├── requirements.txt              # 依赖
+├── .env.example                  # 环境变量示例（不含真实密码）
 └── README.md
 ```
 
@@ -84,6 +97,15 @@ mysql -u root -p < sql/test_data.sql
 mysql -u root -p robot_platform < sql/migrate_operation_logs.sql
 ```
 
+## 测试数据库说明
+
+当前**测试与开发共用同一个数据库**（默认 `robot_platform`，由环境变量 `DB_NAME` 决定）。
+测试会创建/删除临时设备、写入操作日志与登录日志，因此：
+
+- 首次请用 `sql/init.sql` + `sql/test_data.sql` 初始化一个干净库；
+- 多次运行会累积 `operation_logs` / `login_logs`（日志为 append-only，测试不做全表清理）；
+- 若需隔离，可将 `DB_NAME` 改为独立测试库（如 `robot_platform_test`）并在其上执行初始化脚本。
+
 ## 启动 FastAPI
 
 在项目根目录下执行：
@@ -92,6 +114,27 @@ mysql -u root -p robot_platform < sql/migrate_operation_logs.sql
 cd backend
 uvicorn main:app --reload
 ```
+
+## 运行测试
+
+先在一个终端启动后端（见上），然后在另一个终端、项目根目录下执行：
+
+```bash
+# 运行单个测试用例
+python -m pytest tests/test_login.py::test_login_success -v
+
+# 运行单个测试文件
+python -m pytest tests/test_device.py -v
+
+# 运行全部测试
+python -m pytest -v
+
+# 生成 HTML 报告（输出到 reports/report.html）
+python -m pytest --html=reports/report.html --self-contained-html
+```
+
+说明：测试通过 HTTP 调用后端，因此**必须先启动后端**；测试还会直连数据库做断言，
+因此后端与测试必须连接**同一个数据库**。
 
 ## 认证方式
 
@@ -114,9 +157,17 @@ Authorization: Bearer token_alice
 
 - `GET /devices` — 设备列表（admin 全部，user 仅自己）
 - `GET /devices/{device_id}` — 设备详情（admin 任意，user 仅自己）
+- `POST /devices` — 创建设备（owner 由登录用户决定）
+- `DELETE /devices/{device_id}` — 删除设备（保留历史操作日志）
 - `PUT /devices/{device_id}/status` — 修改状态，`status` 取值 `online` / `offline` / `error`
 - `PUT /devices/{device_id}/battery` — 修改电量，`battery` 取值 0-100 的整数
 - `GET /operation-logs` — 操作日志（admin 全部，user 仅自己）
+
+### 日志 / 管理员
+
+- `GET /login-logs` — 登录日志（admin 全部，user 仅自己）
+- `GET /admin/devices` — 管理员查看全部设备（仅 admin）
+- `GET /admin/statistics` — 管理员查看统计（用户数/设备数/在线数/平均电量）
 
 ## 业务错误码
 
