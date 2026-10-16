@@ -1,17 +1,13 @@
 -- ============================================================
--- robot_platform 数据库初始化脚本（唯一入口）
+-- 数据库表结构初始化脚本
 --
--- 从零初始化整个数据库。本脚本与后端代码实际使用的表结构保持一致：
+-- 只负责建表，不创建/选择数据库；目标库由执行命令指定，例如：
+--   mysql -u root -p robot_platform_test < sql/init.sql
+-- 表结构与后端代码实际使用保持一致：
 --   - 所有主键与外键统一使用 INT（与 users.id / devices.id 一致）；
 --   - users.role / users.status 使用 VARCHAR（而非 ENUM）；
 --   - operation_logs.device_id 可空、含 device_name 快照（设备删除保留历史日志）。
 -- ============================================================
-
-CREATE DATABASE IF NOT EXISTS robot_platform
-  DEFAULT CHARACTER SET utf8mb4
-  DEFAULT COLLATE utf8mb4_unicode_ci;
-
-USE robot_platform;
 
 -- ------------------------------------------------------------
 -- 用户表

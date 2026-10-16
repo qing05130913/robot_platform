@@ -20,6 +20,29 @@ def api_client():
     return APIClient()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _require_test_database():
+    """安全护栏：pytest 必须连接测试库 robot_platform_test，否则直接失败。
+
+    通过查询实际连接（SELECT DATABASE()）而非环境变量字符串来判断，
+    避免「配置写了测试库、实际却连了开发库」的情况。该护栏为 session 级
+    autouse，先于所有测试运行，可覆盖所有经 get_connection() 的测试连接。
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DATABASE()")
+            row = cur.fetchone()
+        actual = row["DATABASE()"] if row else None
+    finally:
+        conn.close()
+
+    assert actual == "robot_platform_test", (
+        f"pytest 必须连接测试库 robot_platform_test，当前实际连接 {actual!r}。"
+        f"请设置 $env:DB_NAME='robot_platform_test' 后再运行 pytest。"
+    )
+
+
 @pytest.fixture()
 def db():
     """单次测试用的数据库连接，用后可靠关闭。"""

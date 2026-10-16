@@ -40,13 +40,15 @@ backend-demo/
 │   └── test_admin.py
 │
 ├── sql/                          # 数据库脚本
-│   ├── init.sql                  # 建库建表（唯一初始化入口）
+│   ├── init.sql                  # 建表（目标库由命令指定）
 │   ├── test_data.sql             # 基础种子数据
 │   └── migrate_operation_logs.sql # 旧库升级（保留历史日志）
 │
 ├── config.py                     # 测试侧环境变量（BASE_URL / TIMEOUT）
 ├── pytest.ini                    # pytest 配置
 ├── requirements.txt              # 依赖
+├── start_test_backend.ps1        # 启动测试专用后端（PowerShell）
+├── run_tests.ps1                 # 运行 pytest（PowerShell）
 ├── .env.example                  # 环境变量示例（不含真实密码）
 └── README.md
 ```
@@ -81,45 +83,75 @@ PowerShell 示例：
 $env:DB_PASSWORD = "你的MySQL密码"
 ```
 
-## 初始化 MySQL
+## 初始化数据库
 
-从零初始化（`init.sql` 是唯一入口，主键统一为 INT）：
+`init.sql` 只负责建表，不建库也不选库，目标库名由命令指定。首次需先手动建库。
 
-```bash
-mysql -u root -p < sql/init.sql
-mysql -u root -p < sql/test_data.sql
+### 开发库 robot_platform
+
+```powershell
+# 1) 建库（已存在可跳过）
+mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS robot_platform DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE utf8mb4_unicode_ci"
+
+# 2) 建表 + 灌种子数据
+mysql -u root -p robot_platform < sql/init.sql
+mysql -u root -p robot_platform < sql/test_data.sql
 ```
 
-若已存在旧库，且 `operation_logs` 尚无 `device_name` 列 / `device_id` 不可空，
-执行一次迁移即可（不删除任何数据）：
+### 测试库 robot_platform_test
 
-```bash
-mysql -u root -p robot_platform < sql/migrate_operation_logs.sql
+```powershell
+mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS robot_platform_test DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE utf8mb4_unicode_ci"
+mysql -u root -p robot_platform_test < sql/init.sql
+mysql -u root -p robot_platform_test < sql/test_data.sql
 ```
 
-## 测试数据库说明
+> 旧库升级：若旧库 `operation_logs` 尚无 `device_name` 列 / `device_id` 不可空，
+> 执行 `mysql -u root -p robot_platform < sql/migrate_operation_logs.sql`（不删除数据）。
+> 新建的 `robot_platform_test` 不需要此迁移。
 
-当前**测试与开发共用同一个数据库**（默认 `robot_platform`，由环境变量 `DB_NAME` 决定）。
-测试会创建/删除临时设备、写入操作日志与登录日志，因此：
+## 测试数据库隔离
 
-- 首次请用 `sql/init.sql` + `sql/test_data.sql` 初始化一个干净库；
-- 多次运行会累积 `operation_logs` / `login_logs`（日志为 append-only，测试不做全表清理）；
-- 若需隔离，可将 `DB_NAME` 改为独立测试库（如 `robot_platform_test`）并在其上执行初始化脚本。
+- **开发库 `robot_platform`**：日常开发启动后端时使用（`DB_NAME` 未设置时的默认值）。
+- **测试库 `robot_platform_test`**：运行自动化测试时，后端与 pytest 都必须连接它。
+- 切换方式：环境变量 `DB_NAME` + `TEST_MODE`，见下方「启动后端」「运行测试」。
 
-## 启动 FastAPI
+安全护栏（两层）：
+1. pytest 侧：`tests/conftest.py` 的 autouse fixture 执行 `SELECT DATABASE()`，
+   实际库不是 `robot_platform_test` 时直接失败。
+2. 后端侧：`TEST_MODE=1` 启动时，`backend/main.py` 校验实际库必须是
+   `robot_platform_test`，否则拒绝启动。
 
-在项目根目录下执行：
+多次运行会累积 `operation_logs` / `login_logs`（日志 append-only，测试不做全表清理）。
 
-```bash
+## 启动后端
+
+### 日常开发后端（连接开发库 robot_platform）
+
+```powershell
 cd backend
 uvicorn main:app --reload
 ```
 
+### 测试专用后端（连接测试库 robot_platform_test）
+
+```powershell
+cd backend
+$env:DB_NAME = "robot_platform_test"
+$env:TEST_MODE = "1"
+uvicorn main:app --reload
+```
+
+`TEST_MODE=1` 会让后端在启动时校验实际连接的是测试库，否则拒绝启动。
+也可以直接执行 `.\start_test_backend.ps1`。
+
 ## 运行测试
 
-先在一个终端启动后端（见上），然后在另一个终端、项目根目录下执行：
+先启动「测试专用后端」（见上），再在另一个终端、项目根目录下执行：
 
-```bash
+```powershell
+$env:DB_NAME = "robot_platform_test"
+
 # 运行单个测试用例
 python -m pytest tests/test_login.py::test_login_success -v
 
@@ -133,8 +165,11 @@ python -m pytest -v
 python -m pytest --html=reports/report.html --self-contained-html
 ```
 
-说明：测试通过 HTTP 调用后端，因此**必须先启动后端**；测试还会直连数据库做断言，
-因此后端与测试必须连接**同一个数据库**。
+说明：
+- 测试通过 HTTP 调用后端，因此**必须先启动测试专用后端**（连 `robot_platform_test`）。
+- pytest 也会直连数据库，且 `conftest.py` 会校验实际连接的是 `robot_platform_test`，连错直接报错停止。
+- 如何验证：后端 `GET /test-db` 返回的 `db_name` 应为 `robot_platform_test`。
+- 也可以直接执行 `.\run_tests.ps1`（等价于先设 `$env:DB_NAME` 再跑 pytest）。
 
 ## 认证方式
 

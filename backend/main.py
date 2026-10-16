@@ -5,12 +5,15 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from database import get_connection
+from database import assert_test_database, get_connection
 from routers.admin import router as admin_router
 from routers.auth import router as auth_router
 from routers.devices import router as devices_router
 from routers.login_logs import router as login_logs_router
 from routers.users import router as users_router
+
+# 测试模式安全校验：TEST_MODE=1 时，启动前确认实际连接的是测试库。
+assert_test_database()
 
 app = FastAPI(
     title="Robot Platform API",
