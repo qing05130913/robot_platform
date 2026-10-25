@@ -5,6 +5,14 @@
 """
 import pytest
 
+from common.assertions import (
+    CODE_FORBIDDEN,
+    CODE_NOT_FOUND,
+    CODE_UNAUTHORIZED,
+    assert_biz_error,
+    assert_success,
+)
+
 # 只保留业务键；user_id / role / status 由 conftest.users 动态解析。
 USERNAMES = ["alice", "bob", "admin"]
 
@@ -32,9 +40,7 @@ def test_get_current_user(username, api_client, users):
 
     response = api_client.get("/user", token=f"token_{username}")
 
-    assert response.status_code == 200
-    result = response.json()
-    assert result["code"] == 0
+    result = assert_success(response)
     assert result["data"]["user_id"] == user["id"]
     assert result["data"]["username"] == username
 
@@ -42,7 +48,7 @@ def test_get_current_user(username, api_client, users):
 @pytest.mark.parametrize("token", ["token_wrong", "token_nobody"])
 def test_get_current_user_invalid_token(token, api_client):
     response = api_client.get("/user", token=token)
-    assert response.status_code == 401
+    assert_biz_error(response, 401, CODE_UNAUTHORIZED)
 
 
 # =========================
@@ -58,12 +64,11 @@ def test_get_user_permission(username, target_username, api_client, users):
     response = api_client.get(f"/users/{target_user['id']}", token=f"token_{username}")
 
     expected = expected_user_access_status(current_user, target_user["id"])
-    assert response.status_code == expected
-
     if expected == 200:
-        result = response.json()
-        assert result["code"] == 0
+        result = assert_success(response)
         assert result["data"]["user_id"] == target_user["id"]
+    else:
+        assert_biz_error(response, 403, CODE_FORBIDDEN)
 
 
 # =========================
@@ -74,7 +79,7 @@ def test_get_nonexistent_user(api_client, users):
     # 用「当前最大用户 ID + 1000」作为必然不存在的哨兵值，避免魔法数字。
     nonexistent_id = max(u["id"] for u in users.values()) + 1000
     response = api_client.get(f"/users/{nonexistent_id}", token="token_admin")
-    assert response.status_code == 404
+    assert_biz_error(response, 404, CODE_NOT_FOUND)
 
 
 # =========================
@@ -88,13 +93,13 @@ def test_get_users(username, api_client, users):
     response = api_client.get("/users", token=f"token_{username}")
 
     expected = expected_list_users_status(current_user)
-    assert response.status_code == expected
-
     if expected == 200:
-        result = response.json()
+        result = assert_success(response)
         assert isinstance(result["data"], list)
         assert len(result["data"]) > 0
 
         user_ids = {u["user_id"] for u in result["data"]}
         expected_ids = {u["id"] for u in users.values()}
         assert user_ids == expected_ids
+    else:
+        assert_biz_error(response, 403, CODE_FORBIDDEN)

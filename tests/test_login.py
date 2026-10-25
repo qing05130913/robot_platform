@@ -3,14 +3,21 @@ import uuid
 
 import pytest
 
+from common.assertions import (
+    CODE_USER_DISABLED,
+    CODE_USER_NOT_FOUND,
+    CODE_WRONG_PASSWORD,
+    assert_biz_error,
+    assert_success,
+    assert_validation_error,
+)
+
 
 def test_login_success(api_client, users):
     """登录成功：token 为固定格式 token_<username>，user_id / role 与数据库一致。"""
     response = api_client.post("/login", json={"username": "alice", "password": "123456"})
 
-    assert response.status_code == 200
-    result = response.json()
-    assert result["code"] == 0
+    result = assert_success(response)
     assert result["data"]["token"] == "token_alice"
     assert result["data"]["username"] == "alice"
     assert result["data"]["user_id"] == users["alice"]["id"]
@@ -20,18 +27,19 @@ def test_login_success(api_client, users):
 @pytest.mark.parametrize(
     "username, password, expected_status, expected_code",
     [
-        ("alice", "wrong", 401, 10002),          # 密码错误
-        ("nosuchuser", "123456", 401, 10001),    # 用户不存在
-        ("", "123456", 422, None),               # 空用户名
-        ("alice", "", 422, None),                # 空密码
+        ("alice", "wrong", 401, CODE_WRONG_PASSWORD),       # 密码错误
+        ("nosuchuser", "123456", 401, CODE_USER_NOT_FOUND),  # 用户不存在
+        ("", "123456", 422, None),                # 空用户名
+        ("alice", "", 422, None),                 # 空密码
     ],
 )
 def test_login_failure(username, password, expected_status, expected_code, api_client):
     response = api_client.post("/login", json={"username": username, "password": password})
 
-    assert response.status_code == expected_status
-    if expected_status != 422:
-        assert response.json()["code"] == expected_code
+    if expected_status == 422:
+        assert_validation_error(response)
+    else:
+        assert_biz_error(response, expected_status, expected_code)
 
 
 @pytest.fixture()
@@ -57,5 +65,4 @@ def test_login_disabled_user(disabled_user, api_client):
         "/login",
         json={"username": disabled_user["username"], "password": disabled_user["password"]},
     )
-    assert response.status_code == 403
-    assert response.json()["code"] == 10003
+    assert_biz_error(response, 403, CODE_USER_DISABLED)
