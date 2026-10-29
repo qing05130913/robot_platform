@@ -5,11 +5,13 @@
 """
 import pytest
 
+from backend.schemas.user import UserListResponse, UserResponse
 from common.assertions import (
     CODE_FORBIDDEN,
     CODE_NOT_FOUND,
     CODE_UNAUTHORIZED,
     assert_biz_error,
+    assert_contract,
     assert_success,
 )
 
@@ -35,12 +37,14 @@ def expected_list_users_status(user: dict) -> int:
 # =========================
 
 @pytest.mark.parametrize("username", ["alice", "bob"])
+@pytest.mark.smoke
 def test_get_current_user(username, api_client, users):
     user = users[username]
 
     response = api_client.get("/user", token=f"token_{username}")
 
     result = assert_success(response)
+    assert_contract(response, UserResponse)
     assert result["data"]["user_id"] == user["id"]
     assert result["data"]["username"] == username
 
@@ -57,6 +61,7 @@ def test_get_current_user_invalid_token(token, api_client):
 
 @pytest.mark.parametrize("username", USERNAMES)
 @pytest.mark.parametrize("target_username", USERNAMES)
+@pytest.mark.permission
 def test_get_user_permission(username, target_username, api_client, users):
     current_user = users[username]
     target_user = users[target_username]
@@ -66,6 +71,7 @@ def test_get_user_permission(username, target_username, api_client, users):
     expected = expected_user_access_status(current_user, target_user["id"])
     if expected == 200:
         result = assert_success(response)
+        assert_contract(response, UserResponse)
         assert result["data"]["user_id"] == target_user["id"]
     else:
         assert_biz_error(response, 403, CODE_FORBIDDEN)
@@ -87,6 +93,7 @@ def test_get_nonexistent_user(api_client, users):
 # =========================
 
 @pytest.mark.parametrize("username", USERNAMES)
+@pytest.mark.permission
 def test_get_users(username, api_client, users):
     current_user = users[username]
 
@@ -95,6 +102,7 @@ def test_get_users(username, api_client, users):
     expected = expected_list_users_status(current_user)
     if expected == 200:
         result = assert_success(response)
+        assert_contract(response, UserListResponse)
         assert isinstance(result["data"], list)
         assert len(result["data"]) > 0
 

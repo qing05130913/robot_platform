@@ -1,6 +1,4 @@
 """认证相关的请求 / 响应模型。"""
-from typing import Optional
-
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -27,4 +25,4 @@ class LoginData(BaseModel):
 class LoginResponse(BaseModel):
     code: int
     message: str
-    data: Optional[LoginData] = None
+    data: LoginData

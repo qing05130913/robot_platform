@@ -7,21 +7,21 @@ from database import get_connection
 def list_login_logs(user_id: Optional[int] = None) -> list:
     """获取登录日志；user_id 为 None 时返回全部（admin 用）。
 
-    关联 users 表补充用户名，user_id 为 NULL 的日志也能正常返回。
+    优先使用写入时的用户名快照（l.username），user_id 为 NULL 时也能返回尝试的用户名。
     """
     connection = get_connection()
     try:
         with connection.cursor() as cursor:
             if user_id is None:
                 cursor.execute(
-                    "SELECT l.id, l.user_id, u.username, l.result, l.created_at "
+                    "SELECT l.id, l.user_id, COALESCE(l.username, u.username) AS username, l.result, l.created_at "
                     "FROM login_logs l "
                     "LEFT JOIN users u ON l.user_id = u.id "
                     "ORDER BY l.id DESC"
                 )
             else:
                 cursor.execute(
-                    "SELECT l.id, l.user_id, u.username, l.result, l.created_at "
+                    "SELECT l.id, l.user_id, COALESCE(l.username, u.username) AS username, l.result, l.created_at "
                     "FROM login_logs l "
                     "LEFT JOIN users u ON l.user_id = u.id "
                     "WHERE l.user_id = %s "

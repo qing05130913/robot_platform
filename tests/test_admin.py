@@ -2,11 +2,14 @@
 import pytest
 
 from backend.database import get_connection
+from backend.schemas.admin import StatisticsResponse
+from backend.schemas.device import DeviceListResponse
 from common.api_client import APIClient
 from common.assertions import (
     CODE_FORBIDDEN,
     CODE_UNAUTHORIZED,
     assert_biz_error,
+    assert_contract,
     assert_success,
 )
 
@@ -61,11 +64,13 @@ def _expected_error_code(status):
         ("token_wrong", 401),
     ],
 )
+@pytest.mark.permission
 def test_admin_get_devices(token, expected_status):
     response = client.get("/admin/devices", token=token)
 
     if expected_status == 200:
         result = assert_success(response)
+        assert_contract(response, DeviceListResponse)
 
         device_names = {device["name"] for device in result["data"]}
 
@@ -84,6 +89,7 @@ def test_admin_get_devices(token, expected_status):
         ("token_wrong", 401),
     ],
 )
+@pytest.mark.permission
 def test_admin_get_statistics(token, expected_status):
     # 成功场景在请求前从数据库独立计算预期值，避免依赖接口响应
     expected = _get_db_statistics() if expected_status == 200 else None
@@ -92,6 +98,7 @@ def test_admin_get_statistics(token, expected_status):
 
     if expected_status == 200:
         result = assert_success(response)
+        assert_contract(response, StatisticsResponse)
 
         data = result["data"]
 

@@ -3,9 +3,16 @@
 本文件只涉及 login_logs（登录日志）。登录日志数据由本模块的 login_logs_data
 fixture 自行产生，不依赖其他测试。operation_logs（设备操作日志）见 test_device.py。
 """
+import uuid
+
 import pytest
 
-from common.assertions import CODE_UNAUTHORIZED, assert_biz_error, assert_success
+from common.assertions import (
+    CODE_UNAUTHORIZED,
+    CODE_USER_NOT_FOUND,
+    assert_biz_error,
+    assert_success,
+)
 
 USERNAMES = ["alice", "bob", "admin"]
 
@@ -19,6 +26,7 @@ def login_logs_data(api_client):
 
 
 @pytest.mark.parametrize("username", USERNAMES)
+@pytest.mark.permission
 def test_get_login_logs(login_logs_data, username, api_client, users):
     user = users[username]
 
@@ -40,3 +48,26 @@ def test_get_login_logs_invalid_token(api_client):
     response = api_client.get("/login-logs", token="token_wrong")
 
     assert_biz_error(response, 401, CODE_UNAUTHORIZED)
+
+
+def test_login_logs_records_username_snapshot(api_client, db):
+    """登录失败（用户不存在）时，登录日志应记录尝试的用户名快照。"""
+    username = f"nosuch_{uuid.uuid4().hex[:8]}"
+
+    try:
+        response = api_client.post("/login", json={"username": username, "password": "x"})
+        assert_biz_error(response, 401, CODE_USER_NOT_FOUND)
+
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT user_id, username, result FROM login_logs WHERE username = %s ORDER BY id DESC",
+                (username,),
+            )
+            rows = cur.fetchall()
+
+        assert rows, "登录日志未记录该用户名的失败尝试"
+        assert rows[0]["user_id"] is None
+        assert rows[0]["result"] == "failed"
+    finally:
+        with db.cursor() as cur:
+            cur.execute("DELETE FROM login_logs WHERE username = %s", (username,))

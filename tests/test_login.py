@@ -13,6 +13,7 @@ from common.assertions import (
 )
 
 
+@pytest.mark.smoke
 def test_login_success(api_client, users):
     """登录成功：token 为固定格式 token_<username>，user_id / role 与数据库一致。"""
     response = api_client.post("/login", json={"username": "alice", "password": "123456"})

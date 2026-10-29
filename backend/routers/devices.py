@@ -26,10 +26,17 @@ router = APIRouter(tags=["devices"])
 
 
 def _get_accessible_device(device_id: int, current_user: dict) -> dict:
-    """校验设备存在性与访问权限，返回设备信息。"""
+    """校验设备存在性与访问权限，返回设备信息。
+
+    普通用户对不存在的设备也返回 403（而非 404），避免泄露设备是否存在，
+    与用户接口的越权口径保持一致。
+    """
     device = get_device(device_id)
     if device is None:
-        raise HTTPException(status_code=404, detail={"code": 10404, "message": "设备不存在"})
+        # admin 有权知道"不存在"；普通用户一律 403，不暴露设备是否存在
+        if current_user["role"] == "admin":
+            raise HTTPException(status_code=404, detail={"code": 10404, "message": "设备不存在"})
+        raise HTTPException(status_code=403, detail={"code": 10403, "message": "无权限访问"})
     if current_user["role"] != "admin" and device["owner_id"] != current_user["user_id"]:
         raise HTTPException(status_code=403, detail={"code": 10403, "message": "无权限访问"})
     return device

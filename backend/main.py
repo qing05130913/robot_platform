@@ -3,6 +3,8 @@
 本文件负责创建 FastAPI 应用、注册业务路由，并统一异常响应格式。
 """
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from database import assert_test_database, get_connection
@@ -41,6 +43,15 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
         status_code=exc.status_code,
         content={"code": code, "message": message, "data": None},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """将 422 参数校验失败也统一转换为业务响应格式 {code, message, data}。"""
+    return JSONResponse(
+        status_code=422,
+        content={"code": 422, "message": "参数校验失败", "data": jsonable_encoder(exc.errors())},
     )
 
 

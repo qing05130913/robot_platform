@@ -13,12 +13,14 @@ import uuid
 import pytest
 
 import common.logger
+from backend.schemas.device import DeviceListResponse, DeviceResponse, OperationLogListResponse
 from common.assertions import (
     CODE_DUPLICATE_NAME,
     CODE_FORBIDDEN,
     CODE_NOT_FOUND,
     CODE_UNAUTHORIZED,
     assert_biz_error,
+    assert_contract,
     assert_success,
     assert_validation_error,
 )
@@ -98,11 +100,13 @@ def _operation_logs_after(db, log_id):
         ("token_wrong", 401, None),
     ],
 )
+@pytest.mark.smoke
 def test_get_devices(token, expected_status, expected_owner, api_client, users):
     response = api_client.get("/devices", token=token)
 
     if expected_status == 200:
         result = assert_success(response)
+        assert_contract(response, DeviceListResponse)
         assert isinstance(result["data"], list)
 
         devices = result["data"]
@@ -124,6 +128,7 @@ def test_get_devices(token, expected_status, expected_owner, api_client, users):
 
 @pytest.mark.parametrize("username", USERNAMES)
 @pytest.mark.parametrize("device_name", DEVICE_NAMES)
+@pytest.mark.permission
 def test_get_device(username, device_name, api_client, users, devices):
     user = users[username]
     device = devices[device_name]
@@ -133,6 +138,7 @@ def test_get_device(username, device_name, api_client, users, devices):
     expected = expected_permission_status(user, device)
     if expected == 200:
         result = assert_success(response)
+        assert_contract(response, DeviceResponse)
         assert result["data"]["id"] == device["id"]
         assert result["data"]["owner_id"] == device["owner_id"]
     else:
@@ -144,9 +150,9 @@ def test_get_device(username, device_name, api_client, users, devices):
     [
         ("token_wrong", "Robot-A", 401),  # 无 token：鉴权先于设备存在性
         ("token_wrong", None, 401),
-        ("token_alice", None, 404),       # 设备不存在
-        ("token_bob", None, 404),
-        ("token_admin", None, 404),
+        ("token_alice", None, 403),       # 非属主查不存在设备：不泄露存在性
+        ("token_bob", None, 403),
+        ("token_admin", None, 404),       # admin 有权知道"不存在"
     ],
 )
 def test_get_device_abnormal(token, device_ref, expected_status, api_client, devices):
@@ -155,6 +161,8 @@ def test_get_device_abnormal(token, device_ref, expected_status, api_client, dev
 
     if expected_status == 401:
         assert_biz_error(response, 401, CODE_UNAUTHORIZED)
+    elif expected_status == 403:
+        assert_biz_error(response, 403, CODE_FORBIDDEN)
     else:
         assert_biz_error(response, 404, CODE_NOT_FOUND)
 
@@ -165,6 +173,7 @@ def test_get_device_abnormal(token, device_ref, expected_status, api_client, dev
 
 @pytest.mark.parametrize("username", USERNAMES)
 @pytest.mark.parametrize("device_name", DEVICE_NAMES)
+@pytest.mark.permission
 def test_update_device_status_permission(username, device_name, api_client, users, devices, db):
     user = users[username]
     device = devices[device_name]
@@ -197,6 +206,7 @@ def test_update_device_status_permission(username, device_name, api_client, user
         ("admin", "Robot-A", "error"),
     ],
 )
+@pytest.mark.smoke
 def test_update_device_status_success(username, device_name, new_status, api_client, users, devices, db):
     user = users[username]
     device_id = devices[device_name]["id"]
@@ -235,8 +245,8 @@ def test_update_device_status_success(username, device_name, new_status, api_cli
     "token, device_ref, status_value, expected_status",
     [
         ("token_wrong", "Robot-A", "offline", 401),
-        ("token_alice", None, "offline", 404),
-        ("token_bob", None, "offline", 404),
+        ("token_alice", None, "offline", 403),
+        ("token_bob", None, "offline", 403),
         ("token_admin", None, "offline", 404),
         ("token_alice", "Robot-A", "invalid", 422),
         ("token_alice", "Robot-A", "", 422),
@@ -252,6 +262,8 @@ def test_update_device_status_abnormal(token, device_ref, status_value, expected
 
     if expected_status == 401:
         assert_biz_error(response, 401, CODE_UNAUTHORIZED)
+    elif expected_status == 403:
+        assert_biz_error(response, 403, CODE_FORBIDDEN)
     elif expected_status == 404:
         assert_biz_error(response, 404, CODE_NOT_FOUND)
     else:
@@ -291,6 +303,7 @@ def test_update_device_battery_boundary(battery, expected_status, api_client, de
 
 @pytest.mark.parametrize("username", USERNAMES)
 @pytest.mark.parametrize("device_name", DEVICE_NAMES)
+@pytest.mark.permission
 def test_update_device_battery_permission(username, device_name, api_client, users, devices, db):
     user = users[username]
     device = devices[device_name]
@@ -323,6 +336,7 @@ def test_update_device_battery_permission(username, device_name, api_client, use
         ("admin", "Robot-A", 80),
     ],
 )
+@pytest.mark.smoke
 def test_update_device_battery_success(username, device_name, new_battery, api_client, users, devices, db):
     user = users[username]
     device_id = devices[device_name]["id"]
@@ -361,8 +375,8 @@ def test_update_device_battery_success(username, device_name, new_battery, api_c
     "token, device_ref, battery, expected_status",
     [
         ("token_wrong", "Robot-A", 50, 401),
-        ("token_alice", None, 50, 404),
-        ("token_bob", None, 50, 404),
+        ("token_alice", None, 50, 403),
+        ("token_bob", None, 50, 403),
         ("token_admin", None, 50, 404),
         ("token_alice", "Robot-A", -1, 422),
         ("token_alice", "Robot-A", 101, 422),
@@ -378,6 +392,8 @@ def test_update_device_battery_abnormal(token, device_ref, battery, expected_sta
 
     if expected_status == 401:
         assert_biz_error(response, 401, CODE_UNAUTHORIZED)
+    elif expected_status == 403:
+        assert_biz_error(response, 403, CODE_FORBIDDEN)
     elif expected_status == 404:
         assert_biz_error(response, 404, CODE_NOT_FOUND)
     else:
@@ -413,6 +429,7 @@ def operation_log_marker(db, users, devices):
 
 
 @pytest.mark.parametrize("username", USERNAMES)
+@pytest.mark.permission
 def test_get_operation_logs(operation_log_marker, username, api_client, users):
     user = users[username]
     marker = operation_log_marker
@@ -420,6 +437,7 @@ def test_get_operation_logs(operation_log_marker, username, api_client, users):
     response = api_client.get("/operation-logs", token=f"token_{username}")
 
     result = assert_success(response)
+    assert_contract(response, OperationLogListResponse)
 
     logs = result["data"]
     # 本次测试准备的数据确实出现在返回结果中
@@ -453,6 +471,7 @@ def test_get_operation_logs_invalid_token(api_client):
         ("alice", "bob", 403),    # 非属主删除
     ],
 )
+@pytest.mark.permission
 def test_delete_device_permission(create_username, delete_username, expected_status, api_client):
     device_id = None
     device_name = f"Robot-Del-{uuid.uuid4().hex[:8]}"
@@ -464,14 +483,20 @@ def test_delete_device_permission(create_username, delete_username, expected_sta
             json={"name": device_name, "status": "offline", "battery": 80},
         )
         result = assert_success(create_response)
+        assert_contract(create_response, DeviceResponse)
         device_id = result["data"]["id"]
 
         response = api_client.delete(f"/devices/{device_id}", token=f"token_{delete_username}")
 
         if expected_status == 200:
             assert_success(response)
-            check = api_client.get(f"/devices/{device_id}", token=f"token_{delete_username}")
+            # 已删除：admin 能确认设备不存在（404）
+            check = api_client.get(f"/devices/{device_id}", token="token_admin")
             assert_biz_error(check, 404, CODE_NOT_FOUND)
+            if delete_username != "admin":
+                # 普通用户查不存在的设备统一 403，不泄露设备是否存在
+                check = api_client.get(f"/devices/{device_id}", token=f"token_{delete_username}")
+                assert_biz_error(check, 403, CODE_FORBIDDEN)
         else:
             assert_biz_error(response, 403, CODE_FORBIDDEN)
             check = api_client.get(f"/devices/{device_id}", token=f"token_{create_username}")
@@ -520,9 +545,11 @@ def test_delete_device_preserves_operation_logs(api_client, users, db):
         r = api_client.delete(f"/devices/{device_id}", token="token_alice")
         assert_success(r)
 
-        # 设备已不存在
-        r = api_client.get(f"/devices/{device_id}", token="token_alice")
+        # 设备已不存在：admin 看到 404，普通用户看到 403（不泄露存在性）
+        r = api_client.get(f"/devices/{device_id}", token="token_admin")
         assert_biz_error(r, 404, CODE_NOT_FOUND)
+        r = api_client.get(f"/devices/{device_id}", token="token_alice")
+        assert_biz_error(r, 403, CODE_FORBIDDEN)
 
         # 历史日志仍存在：device_id 置空、device_name 快照保留、操作者/动作/时间完整
         with db.cursor() as cur:
@@ -560,6 +587,7 @@ def test_delete_device_preserves_operation_logs(api_client, users, db):
 # ============================================================
 
 @pytest.mark.parametrize("username", USERNAMES)
+@pytest.mark.smoke
 def test_create_device(username, api_client, users):
     device_id = None
     device_name = f"Robot-Test-{username}-{uuid.uuid4().hex[:8]}"
@@ -571,11 +599,13 @@ def test_create_device(username, api_client, users):
             json={"name": device_name, "status": "offline", "battery": 80},
         )
         result = assert_success(response)
+        assert_contract(response, DeviceResponse)
         device_id = result["data"]["id"]
 
         # GET 回读并校验设备归属
         response = api_client.get(f"/devices/{device_id}", token=f"token_{username}")
         result = assert_success(response)
+        assert_contract(response, DeviceResponse)
         data = result["data"]
         assert data["name"] == device_name
         assert data["owner_id"] == users[username]["id"]
